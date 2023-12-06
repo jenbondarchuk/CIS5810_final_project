@@ -6,6 +6,43 @@ from netdissect import upsample, tally, imgviz, imgsave, bargraph
 import setting
 import netdissect
 torch.backends.cudnn.benchmark = True
+import torchvision.models as models
+from torch.utils.data import Dataset
+from PIL import Image
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+import torchvision
+from netdissect import parallelfolder
+    
+def load_nst_data(path_to_data="/home/jen/Documents/git/dissect/experiment/datasets/styles"):
+    """Reusing their data structure for image classification.
+    
+    Will update ours to be binary, started with each style just to see what would happen.
+    So the structure is the same as in our google drive.
+    """
+    imsize = 512 if torch.cuda.is_available() else 128  # use small size if no GPU
+
+    loader = transforms.Compose([
+        transforms.Resize((imsize, imsize)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225])
+    ])
+
+    # Use their loader, pass our transform here
+    return parallelfolder.ParallelImageFolders([path_to_data],
+                classification=True,
+                shuffle=True,
+                transform=loader)
+
+def load_nst_model(path_to_model="/home/jen/Downloads/mobilenetv2_finetuned.pt"):
+    """Load our model, wrap with instrumented model so we can do network dissection."""
+    model = models.mobilenet_v2(pretrained=True)
+    model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, 2)
+    model.load_state_dict(torch.load(path_to_model))
+    model = nethook.InstrumentedModel(model).cuda().eval()
+    return model
 
 def parseargs():
     parser = argparse.ArgumentParser()
@@ -23,7 +60,7 @@ def parseargs():
     aa('--miniou', type=float, default=0.04)
     aa('--thumbsize', type=int, default=100)
     args = parser.parse_args()
-    return args
+    return args 
 
 def main():
     args = parseargs()
@@ -36,22 +73,28 @@ def main():
         resdir += ('-t%d' % (args.thumbsize))
     resfile = pidfile.exclusive_dirfn(resdir)
 
+    # Layers we added content/style loss to for reference
+    # content_layers_default = ['layer_8', 'layer_14']
+    # style_layers_default = ['layer_1', 'layer_2', 'layer_4', 'layer_8', 'layer_14']
+
+    args.layer = "4"
     print("running", args.model, args.dataset, args.layer)
-    model = load_model(args)
+    model = load_nst_model() # load our model
+    # appends feature.<layer>, if model == vgg16, which works for mobilenetv2
     layername = instrumented_layername(args)
     model.retain_layer(layername)
     print("Layer of interest: ", layername)
-    dataset = load_dataset(args, model=model.model)
+    dataset = load_nst_data() # load our dataset
     upfn = make_upfn(args, dataset, model, layername)
     sample_size = len(dataset)
     is_generator = (args.model == 'progan')
     percent_level = 1.0 - args.quantile
     iou_threshold = args.miniou
     image_row_width = 5
-    torch.set_grad_enabled(False)
+    torch.set_grad_enabled(False) # bc we're not training
 
     # Tally rq.np (representation quantile, unconditional).
-    pbar.descnext('rq')
+    pbar.descnext('rq') # just changing progress bar/status message
     def compute_samples(batch, *args):
         data_batch = batch.cuda()
         _ = model(data_batch)
@@ -66,7 +109,7 @@ def main():
                               cachefile=resfile('rq.npz'))
 
     # Create visualizations - first we need to know the topk
-    pbar.descnext('topk')
+    pbar.descnext('topk') # top k values
     def compute_image_max(batch, *args):
         data_batch = batch.cuda()
         _ = model(data_batch)
@@ -122,6 +165,9 @@ def main():
         iacts = (hacts > level_at_99).float() # indicator
         return tally.conditional_samples(iacts, seg)
 
+    # This metric is broken, will debug later
+    # Shape mismatch between something computed in tally.conditional_samples(iacts, seg)
+    # Not sure if upsampling is correct - shape mismatch is 128 vs 56 which is odd
     pbar.descnext('condi99')
     condi99 = tally.tally_conditional_mean(compute_conditional_indicator,
             dataset, sample_size=sample_size,
