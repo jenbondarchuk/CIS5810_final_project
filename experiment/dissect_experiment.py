@@ -1,5 +1,5 @@
 # New-style dissection experiment code.
-import torch, argparse, os, shutil, inspect, json, numpy, random
+import torch, argparse, os, shutil, inspect, json
 from collections import defaultdict
 from netdissect import pbar, nethook, renormalize, pidfile, zdataset
 from netdissect import upsample, tally, imgviz, imgsave, bargraph
@@ -7,20 +7,18 @@ import setting
 import netdissect
 torch.backends.cudnn.benchmark = True
 import torchvision.models as models
-from torch.utils.data import Dataset
-from PIL import Image
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-import torchvision
 from netdissect import parallelfolder
-    
+
+IM_SIZE = 512
+
 def load_nst_data(path_to_data="/home/jen/Documents/git/dissect/experiment/datasets/styles"):
     """Reusing their data structure for image classification.
     
     Will update ours to be binary, started with each style just to see what would happen.
     So the structure is the same as in our google drive.
     """
-    imsize = 512 if torch.cuda.is_available() else 128  # use small size if no GPU
+    imsize = IM_SIZE if torch.cuda.is_available() else 128  # use small size if no GPU
 
     loader = transforms.Compose([
         transforms.Resize((imsize, imsize)),
@@ -48,8 +46,11 @@ def parseargs():
     parser = argparse.ArgumentParser()
     def aa(*args, **kwargs):
         parser.add_argument(*args, **kwargs)
+    # use vgg16 because it appends the correct string for feature layers
+    # otherwise this is ignored to load our own model
     aa('--model', choices=['alexnet', 'vgg16', 'resnet152', 'progan'],
             default='vgg16')
+    # this gets overwritten
     aa('--dataset', choices=['places', 'church', 'kitchen', 'livingroom',
                              'bedroom'],
             default='places')
@@ -79,12 +80,17 @@ def main():
 
     args.layer = "4"
     print("running", args.model, args.dataset, args.layer)
-    model = load_nst_model() # load our model
+
+    # load our model
+    model = load_nst_model()
+
     # appends feature.<layer>, if model == vgg16, which works for mobilenetv2
     layername = instrumented_layername(args)
     model.retain_layer(layername)
     print("Layer of interest: ", layername)
-    dataset = load_nst_data() # load our dataset
+
+    # load our dataset
+    dataset = load_nst_data() 
     upfn = make_upfn(args, dataset, model, layername)
     sample_size = len(dataset)
     is_generator = (args.model == 'progan')
@@ -165,9 +171,8 @@ def main():
         iacts = (hacts > level_at_99).float() # indicator
         return tally.conditional_samples(iacts, seg)
 
-    # This metric is broken, will debug later
-    # Shape mismatch between something computed in tally.conditional_samples(iacts, seg)
-    # Not sure if upsampling is correct - shape mismatch is 128 vs 56 which is odd
+    # Will need to customize this if we have time - will do once
+    # we finalize a dataset
     pbar.descnext('condi99')
     condi99 = tally.tally_conditional_mean(compute_conditional_indicator,
             dataset, sample_size=sample_size,
@@ -218,7 +223,8 @@ def make_upfn(args, dataset, model, layername):
         data_shape = model.retained_layer(layername).shape[2:]
         pbar.print('upsampling from data_shape', tuple(data_shape))
     upfn = upsample.upsampler(
-            (56, 56),
+            (IM_SIZE // 4, IM_SIZE // 4), # target shape is original image scaled down by 4
+            # this value is hardcoded later in this file as downsample=4
             data_shape=data_shape,
             source=dataset,
             convolutions=convs)
