@@ -13,18 +13,30 @@ import torch.nn as nn
 from torchvision import ops
 
 IM_SIZE = 512
+DATASET = "dancer"
+MODEL = "flat"
+quantile=0.01
+miniou = 0.04
+thumbsize=500
+seg = "netpqc" # ['net', 'netp', 'netq', 'netpq', 'netpqc', 'netpqxc']
+
+# Layers we added content/style loss to for reference
+# unflattened:
+# content_layers_default = ['layer_8', 'layer_14']
+# style_layers_default = ['layer_1', 'layer_2', 'layer_4', 'layer_8', 'layer_14']
+
+# flattened:
+# content_layers_default = ['conv_8_2', 'conv_14_2']
+# style_layers_default = ['conv_1_1', 'conv_2_2', 'conv_4_2', 'conv_8_2', 'conv_14_2']
+layername = "conv_8_2"
 
 # run on animation (content) image from Ishita's notebook, with Impressionist style image
 # also run on picasso & dancer
 
 # input content image and style image and input
 
-def load_nst_data(path_to_data="/home/jen/Documents/git/dissect/experiment/datasets/dancer"):
-    """Reusing their data structure for image classification.
-    
-    Will update ours to be binary, started with each style just to see what would happen.
-    So the structure is the same as in our google drive.
-    """
+def load_nst_data(path_to_data=f"/home/jen/Documents/git/dissect/experiment/datasets/{DATASET}"):
+    """Load images."""
     imsize = IM_SIZE if torch.cuda.is_available() else 128  # use small size if no GPU
 
     loader = transforms.Compose([
@@ -42,7 +54,7 @@ def load_nst_data(path_to_data="/home/jen/Documents/git/dissect/experiment/datas
                 transform=loader)
 
 def load_nst_model(path_to_model="/home/jen/Downloads/mobilenetv2_finetuned.pt"):
-    """Load our model, wrap with instrumented model so we can do network dissection."""
+    """Load unflattened model, wrap with instrumented model so we can do network dissection."""
     model = models.mobilenet_v2(pretrained=True)
     model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, 2)
     model.load_state_dict(torch.load(path_to_model))
@@ -93,66 +105,29 @@ def load_flattened_nst_model(path_to_model="/home/jen/Downloads/mobilenetv2_fine
     model_flat = nethook.InstrumentedModel(model_flat).cuda().eval()
     return model_flat
 
-def parseargs():
-    parser = argparse.ArgumentParser()
-    def aa(*args, **kwargs):
-        parser.add_argument(*args, **kwargs)
-    # use vgg16 because it appends the correct string for feature layers
-    # otherwise this is ignored to load our own model
-    aa('--model', choices=['alexnet', 'vgg16', 'resnet152', 'progan'],
-            default='vgg16')
-    # this gets overwritten
-    aa('--dataset', choices=['places', 'church', 'kitchen', 'livingroom',
-                             'bedroom'],
-            default='places')
-    aa('--seg', choices=['net', 'netp', 'netq', 'netpq', 'netpqc', 'netpqxc'],
-            default='netpqc')
-    aa('--layer', default=None)
-    aa('--quantile', type=float, default=0.01)
-    aa('--miniou', type=float, default=0.04)
-    aa('--thumbsize', type=int, default=100)
-    args = parser.parse_args()
-    return args 
-
 def main():
-    args = parseargs()
-    resdir = 'results/%s-%s-%s' % (args.model, args.dataset, args.seg)
-    if args.layer is not None:
-        resdir += '-' + args.layer
-    if args.quantile != 0.005:
-        resdir += ('-%g' % (args.quantile * 1000))
-    if args.thumbsize != 100:
-        resdir += ('-t%d' % (args.thumbsize))
+    resdir = 'results/%s-%s-%s-%s' % (MODEL, DATASET, seg, layername)
     resfile = pidfile.exclusive_dirfn(resdir)
 
-    # Layers we added content/style loss to for reference
-    # content_layers_default = ['layer_8', 'layer_14']
-    # style_layers_default = ['layer_1', 'layer_2', 'layer_4', 'layer_8', 'layer_14']
-
-    # args.layer = "4"
-    print("running", args.model, args.dataset, args.layer)
-
-    # content_layers_default = ['conv_8_2', 'conv_14_2']
-    # style_layers_default = ['conv_1_1', 'conv_2_2', 'conv_4_2', 'conv_8_2', 'conv_14_2']
-
-    # load our model
+    # load model
     model = load_flattened_nst_model()
 
-    # appends feature.<layer>, if model == vgg16, which works for mobilenetv2
-    # layername = instrumented_layername(args)
-    layername = "conv_8_2"
+    # use feature.<layer_numer> for unflattened
+    # use <op_name>_<layer_num>_<index_in_layer> for flattened
+    
     model.retain_layer(layername)
     print("Layer of interest: ", layername)
 
-    # load our dataset
+    # load dataset
     dataset = load_nst_data() 
-    upfn = make_upfn(args, dataset, model, layername)
+
+    # set up remaining functions/arguments for network dissection
+    upfn = make_upfn(dataset, model, layername)
     sample_size = len(dataset)
-    is_generator = (args.model == 'progan')
-    percent_level = 1.0 - args.quantile
-    iou_threshold = args.miniou
+    percent_level = 1.0 - quantile
+    iou_threshold = miniou
     image_row_width = 3
-    torch.set_grad_enabled(False) # bc we're not training
+    torch.set_grad_enabled(False)
 
     # Tally rq.np (representation quantile, unconditional).
     pbar.descnext('rq') # just changing progress bar/status message
@@ -182,26 +157,19 @@ def main():
             batch_size=50, num_workers=30, pin_memory=True,
             cachefile=resfile('topk.npz'))
 
-    # Visualize top-activating patches of top-activatin images.
+    # Visualize top-activating patches of top-activating images.
     pbar.descnext('unit_images')
     image_size, image_source = None, None
-    if is_generator:
-        image_size = model(dataset[0][0].cuda()[None,...]).shape[2:]
-    else:
-        image_source = dataset
-    iv = imgviz.ImageVisualizer((args.thumbsize, args.thumbsize),
+    image_source = dataset
+    iv = imgviz.ImageVisualizer((thumbsize, thumbsize),
         image_size=image_size,
         source=dataset,
         quantiles=rq,
         level=rq.quantiles(percent_level))
     def compute_acts(data_batch, *ignored_class):
         data_batch = data_batch.cuda()
-        out_batch = model(data_batch)
         acts_batch = model.retained_layer(layername)
-        if is_generator:
-            return (acts_batch, out_batch)
-        else:
-            return (acts_batch, data_batch)
+        return (acts_batch, data_batch)
     unit_images = iv.masked_images_for_topk(
             compute_acts, dataset, topk,
             k=image_row_width, num_workers=30, pin_memory=True,
@@ -214,12 +182,11 @@ def main():
     # Grab the 99th percentile, and tally conditional means at that level.
     level_at_99 = rq.quantiles(percent_level).cuda()[None,:,None,None]
 
-    segmodel, seglabels, segcatlabels = setting.load_segmenter(args.seg)
+    segmodel, seglabels, segcatlabels = setting.load_segmenter(seg)
     renorm = renormalize.renormalizer(dataset, target='zc')
     def compute_conditional_indicator(batch, *args):
         data_batch = batch.cuda()
-        out_batch = model(data_batch)
-        image_batch = out_batch if is_generator else renorm(data_batch)
+        image_batch = renorm(data_batch)
         seg = segmodel.segment_batch(image_batch, downsample=1)
         acts = model.retained_layer(layername)
         hacts = upfn(acts)
@@ -246,7 +213,7 @@ def main():
     save_conceptcat_graph(resfile('concepts_99.svg'), labelcat_list)
     dump_json_file(resfile('report.json'), dict(
             header=dict(
-                name='%s %s %s' % (args.model, args.dataset, args.seg),
+                name='%s %s %s' % (MODEL, DATASET, seg),
                 image='concepts_99.svg'),
             units=[
                 dict(image='image/unit%d.jpg' % u,
@@ -257,70 +224,19 @@ def main():
     copy_static_file('report.html', resfile('+report.html'))
     resfile.done();
 
-def make_upfn(args, dataset, model, layername):
+def make_upfn(dataset, model, layername):
     '''Creates an upsampling function.'''
     convs, data_shape = None, None
-    if args.model == 'alexnet':
-        convs = [layer for name, layer in model.model.named_children()
-                if name.startswith('conv') or name.startswith('pool')]
-    elif args.model == 'progan':
-        # Probe the data shape
-        out = model(dataset[0][0][None,...].cuda())
-        data_shape = model.retained_layer(layername).shape[2:]
-        upfn = upsample.upsampler(
-                (64, 64),
-                data_shape=data_shape,
-                image_size=out.shape[2:])
-        return upfn
-    else:
-        # Probe the data shape
-        _ = model(dataset[0][0][None,...].cuda())
-        data_shape = model.retained_layer(layername).shape[2:]
-        pbar.print('upsampling from data_shape', tuple(data_shape))
+    # Probe the data shape
+    _ = model(dataset[0][0][None,...].cuda())
+    data_shape = model.retained_layer(layername).shape[2:]
+    pbar.print('upsampling from data_shape', tuple(data_shape))
     upfn = upsample.upsampler(
-            (IM_SIZE, IM_SIZE), # target shape is original image scaled down by 4
-            # this value is hardcoded later in this file as downsample=4
+            (IM_SIZE, IM_SIZE),
             data_shape=data_shape,
             source=dataset,
             convolutions=convs)
     return upfn
-
-def instrumented_layername(args):
-    '''Chooses the layer name to dissect.'''
-    if args.layer is not None:
-        if args.model == 'vgg16':
-            return 'features.' + args.layer
-        return args.layer
-    # Default layers to probe
-    if args.model == 'alexnet':
-        return 'conv5'
-    elif args.model == 'vgg16':
-        return 'features.conv5_3'
-    elif args.model == 'resnet152':
-        return '7'
-    elif args.model == 'progan':
-        return 'layer4'
-
-def load_model(args):
-    '''Loads one of the benchmark classifiers or generators.'''
-    if args.model in ['alexnet', 'vgg16', 'resnet152']:
-        model = setting.load_classifier(args.model)
-    elif args.model == 'progan':
-        model = setting.load_proggan(args.dataset)
-    model = nethook.InstrumentedModel(model).cuda().eval()
-    return model
-
-def load_dataset(args, model=None):
-    '''Loads an input dataset for testing.'''
-    from torchvision import transforms
-    if args.model == 'progan':
-        dataset = zdataset.z_dataset_for_model(model, size=10000, seed=1)
-        return dataset
-    elif args.dataset in ['places']:
-        crop_size = 227 if args.model == 'alexnet' else 224
-        return setting.load_dataset(args.dataset, split='val', full=True,
-                crop_size=crop_size, download=True)
-    assert False
 
 def graph_conceptcatlist(conceptcatlist, **kwargs):
     count = defaultdict(int)
@@ -393,5 +309,4 @@ def copy_static_file(source, target):
 
 if __name__ == '__main__':
     main()
-
 
