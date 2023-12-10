@@ -1,2 +1,4 @@
 results/
 datasets/
+*venv/
+__pycache__/

@@ -1,128 +1,59 @@
 # New-style dissection experiment code.
-import torch, argparse, os, shutil, inspect, json
-from collections import defaultdict
-from netdissect import pbar, nethook, renormalize, pidfile, zdataset
-from netdissect import upsample, tally, imgviz, imgsave, bargraph
+import torch, argparse
+from netdissect import pbar, nethook, renormalize, pidfile
+from netdissect import tally, imgviz, imgsave
 import setting
-import netdissect
 torch.backends.cudnn.benchmark = True
 import torchvision.models as models
 import torchvision.transforms as transforms
 from netdissect import parallelfolder
 import torch.nn as nn
 from torchvision import ops
+from dissect_experiment import make_upfn, save_conceptcat_graph, dump_json_file, copy_static_file
 
+# configs for our network dissection
 IM_SIZE = 512
-DATASET = "dancer"
-MODEL = "flat"
 quantile=0.01
 miniou = 0.04
 thumbsize=500
-seg = "netpqc" # ['net', 'netp', 'netq', 'netpq', 'netpqc', 'netpqxc']
+seg = "netpqc"
 
-# Layers we added content/style loss to for reference
-# unflattened:
-# content_layers_default = ['layer_8', 'layer_14']
-# style_layers_default = ['layer_1', 'layer_2', 'layer_4', 'layer_8', 'layer_14']
-
-# flattened:
-# content_layers_default = ['conv_8_2', 'conv_14_2']
-# style_layers_default = ['conv_1_1', 'conv_2_2', 'conv_4_2', 'conv_8_2', 'conv_14_2']
-layername = "conv_8_2"
-
-# run on animation (content) image from Ishita's notebook, with Impressionist style image
-# also run on picasso & dancer
-
-# input content image and style image and input
-
-def load_nst_data(path_to_data=f"/home/jen/Documents/git/dissect/experiment/datasets/{DATASET}"):
-    """Load images."""
-    imsize = IM_SIZE if torch.cuda.is_available() else 128  # use small size if no GPU
-
-    loader = transforms.Compose([
-        transforms.Resize((imsize, imsize)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225])
-    ])
-
-    # Use their loader, pass our transform here
-    return parallelfolder.ParallelImageFolders([path_to_data],
-                classification=True,
-                shuffle=True,
-                transform=loader)
-
-def load_nst_model(path_to_model="/home/jen/Downloads/mobilenetv2_finetuned.pt"):
-    """Load unflattened model, wrap with instrumented model so we can do network dissection."""
-    model = models.mobilenet_v2(pretrained=True)
-    model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, 2)
-    model.load_state_dict(torch.load(path_to_model))
-    model = nethook.InstrumentedModel(model).cuda().eval()
-    return model
-
-def get_name_type(layer):
-    if isinstance(layer, nn.Conv2d):
-        name = f'conv'
-    elif isinstance(layer, nn.ReLU6):
-        name = f'relu'
-        layer = nn.ReLU(inplace=False)
-    elif isinstance(layer, nn.MaxPool2d):
-        name = f'pool'
-    elif isinstance(layer, nn.BatchNorm2d):
-        name = f'bn'
-    elif isinstance(layer, ops.Conv2dNormActivation):
-        name = "block"
-    else:
-        raise RuntimeError('Unrecognized layer: {}'.format(layer.__class__.__name__))
-    return name
-
-def load_flattened_nst_model(path_to_model="/home/jen/Downloads/mobilenetv2_finetuned.pt"):
-    cnn = models.mobilenet_v2(pretrained=True)
-    cnn.classifier[1] = torch.nn.Linear(cnn.classifier[1].in_features, 2)
-    cnn.load_state_dict(torch.load(path_to_model))
-    cnn = cnn.features[:15].eval()
-
-    model_flat = nn.Sequential()
-    for block_num, block in enumerate(cnn.children()):
-        layer_num = 0
-        for layers in block.children():
-            if isinstance(layers, nn.Sequential):
-                for layer in layers.children():
-                    name_type = get_name_type(layer)
-                    if name_type == 'block':
-                        for sublayer in layer.children():
-                            sub_name_type = get_name_type(sublayer)
-                            model_flat.add_module(f'{sub_name_type}_{block_num}_{layer_num}', sublayer)
-                    else:
-                        model_flat.add_module(f'{name_type}_{block_num}_{layer_num}', layer)
-                    layer_num += 1
-            else:
-                name_type = get_name_type(layers)
-                model_flat.add_module(f'{name_type}_{block_num}_{layer_num}', layers)
-                layer_num += 1
-
-    model_flat = nethook.InstrumentedModel(model_flat).cuda().eval()
-    return model_flat
+def parseargs():
+    parser = argparse.ArgumentParser(description="Run network dissection on MobileNetV2 variants. Run this script from the root of the repo.")
+    def aa(*args, **kwargs):
+        parser.add_argument(*args, **kwargs)
+    aa('-m', '--model-weights-path', default=None, help="Path to finetuned weights. If no path provided, defaults to pre-trained weights.")
+    aa('-d', '--dataset', default='dancer', help="Directory name for image dataset placed in \"experiments/dataset\"")
+    aa('-l', '--layer', default="conv_4_2", help="Unflattened layer format is features.layer_num. Unflattened is operation_layer_index")
+    aa('--unflat', default=False, action=argparse.BooleanOptionalAction, help="Load flat or unflattened MobileNetV2")
+    args = parser.parse_args()
+    return args 
 
 def main():
-    resdir = 'results/%s-%s-%s-%s' % (MODEL, DATASET, seg, layername)
+    data_dir = "experiment/dataset/"
+
+    args = parseargs()
+    args.model = "MobileNetV2"
+
+    # Get string for results directory name and load model
+    if args.unflat:
+        model_type = "unflat"
+        model = load_unflattened_nst_model(args.model_weights_path)
+    else:
+        model_type = "flat"
+        model = load_flattened_nst_model(args.model_weights_path)
+
+    layername = str(args.layer)
+    resdir = 'results/%s-%s-%s' % (model_type, args.dataset, layername)
     resfile = pidfile.exclusive_dirfn(resdir)
 
-    # load model
-    model = load_flattened_nst_model()
-
-    # use feature.<layer_numer> for unflattened
-    # use <op_name>_<layer_num>_<index_in_layer> for flattened
-    
+    # get layer of interest
     model.retain_layer(layername)
-    print("Layer of interest: ", layername)
-
     # load dataset
-    dataset = load_nst_data() 
+    dataset = load_nst_data(data_dir + args.dataset) 
 
     # set up remaining functions/arguments for network dissection
-    upfn = make_upfn(dataset, model, layername)
+    upfn = make_upfn(args, dataset, model, layername)
     sample_size = len(dataset)
     percent_level = 1.0 - quantile
     iou_threshold = miniou
@@ -213,7 +144,7 @@ def main():
     save_conceptcat_graph(resfile('concepts_99.svg'), labelcat_list)
     dump_json_file(resfile('report.json'), dict(
             header=dict(
-                name='%s %s %s' % (MODEL, DATASET, seg),
+                name='%s %s %s' % (model_type, args.dataset, seg),
                 image='concepts_99.svg'),
             units=[
                 dict(image='image/unit%d.jpg' % u,
@@ -224,89 +155,88 @@ def main():
     copy_static_file('report.html', resfile('+report.html'))
     resfile.done();
 
-def make_upfn(dataset, model, layername):
-    '''Creates an upsampling function.'''
-    convs, data_shape = None, None
-    # Probe the data shape
-    _ = model(dataset[0][0][None,...].cuda())
-    data_shape = model.retained_layer(layername).shape[2:]
-    pbar.print('upsampling from data_shape', tuple(data_shape))
-    upfn = upsample.upsampler(
-            (IM_SIZE, IM_SIZE),
-            data_shape=data_shape,
-            source=dataset,
-            convolutions=convs)
-    return upfn
+def load_nst_data(path_to_data):
+    """Load our datatset.
 
-def graph_conceptcatlist(conceptcatlist, **kwargs):
-    count = defaultdict(int)
-    catcount = defaultdict(int)
-    for c in conceptcatlist:
-        count[c] += 1
-    for c in count.keys():
-        catcount[c[1]] += 1
-    cats = ['object', 'part', 'material', 'texture', 'color']
-    catorder = dict((c, i) for i, c in enumerate(cats))
-    sorted_labels = sorted(count.keys(),
-        key=lambda x: (catorder[x[1]], -count[x]))
-    sorted_labels
-    return bargraph.make_svg_bargraph(
-        [label for label, cat in sorted_labels],
-        [count[k] for k in sorted_labels],
-        [(c, catcount[c]) for c in cats], **kwargs)
+    Provides transform from our impressionist dataset, required for `ParallelImageFolders`.
+    """
+    imsize = IM_SIZE if torch.cuda.is_available() else 128  # use small size if no GPU
 
-def save_conceptcat_graph(filename, conceptcatlist):
-    svg = graph_conceptcatlist(conceptcatlist, barheight=80, file_header=True)
-    with open(filename, 'w') as f:
-        f.write(svg)
+    loader = transforms.Compose([
+        transforms.Resize((imsize, imsize)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225])
+    ])
 
+    # Use their loader, pass our transform here
+    return parallelfolder.ParallelImageFolders([path_to_data],
+                classification=True,
+                shuffle=True,
+                transform=loader)
 
-class FloatEncoder(json.JSONEncoder):
-    def __init__(self, nan_str='"NaN"', **kwargs):
-        super(FloatEncoder, self).__init__(**kwargs)
-        self.nan_str = nan_str
+def load_unflattened_nst_model(path_to_model=None):
+    """Load unflattened MobileNetV2 model, wrap with instrumented model so we can do network dissection.
+    
+    If no path is provided, pytorch's pretrained weights are used.
+    """
+    model = models.mobilenet_v2(pretrained=True)
+    if path_to_model is not None:
+        model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, 2)
+        model.load_state_dict(torch.load(path_to_model))
+    model = nethook.InstrumentedModel(model).cuda().eval()
+    return model
 
-    def iterencode(self, o, _one_shot=False):
-        if self.check_circular:
-            markers = {}
-        else:
-            markers = None
-        if self.ensure_ascii:
-            _encoder = json.encoder.encode_basestring_ascii
-        else:
-            _encoder = json.encoder.encode_basestring
-        def floatstr(o, allow_nan=self.allow_nan,
-                _inf=json.encoder.INFINITY, _neginf=-json.encoder.INFINITY,
-                nan_str=self.nan_str):
-            if o != o:
-                text = nan_str
-            elif o == _inf:
-                text = '"Infinity"'
-            elif o == _neginf:
-                text = '"-Infinity"'
+def get_name_type(layer):
+    """Helper function for flattening. Gets name of layer types in MobileNetV2."""
+    if isinstance(layer, nn.Conv2d):
+        name = f'conv'
+    elif isinstance(layer, nn.ReLU6):
+        name = f'relu'
+        layer = nn.ReLU(inplace=False)
+    elif isinstance(layer, nn.MaxPool2d):
+        name = f'pool'
+    elif isinstance(layer, nn.BatchNorm2d):
+        name = f'bn'
+    elif isinstance(layer, ops.Conv2dNormActivation):
+        name = "block"
+    else:
+        raise RuntimeError('Unrecognized layer: {}'.format(layer.__class__.__name__))
+    return name
+
+def load_flattened_nst_model(path_to_model=None):
+    """Load flattened MobileNetV2 model, wrap with instrumented model so we can do network dissection.
+    
+    If no path is provided, pytorch's pretrained weights are used.
+    """
+    cnn = models.mobilenet_v2(pretrained=True)
+    if path_to_model is not None:
+        cnn.classifier[1] = torch.nn.Linear(cnn.classifier[1].in_features, 2)
+        cnn.load_state_dict(torch.load(path_to_model))
+    cnn = cnn.features[:15].eval()
+
+    model_flat = nn.Sequential()
+    for block_num, block in enumerate(cnn.children()):
+        layer_num = 0
+        for layers in block.children():
+            if isinstance(layers, nn.Sequential):
+                for layer in layers.children():
+                    name_type = get_name_type(layer)
+                    if name_type == 'block':
+                        for sublayer in layer.children():
+                            sub_name_type = get_name_type(sublayer)
+                            model_flat.add_module(f'{sub_name_type}_{block_num}_{layer_num}', sublayer)
+                    else:
+                        model_flat.add_module(f'{name_type}_{block_num}_{layer_num}', layer)
+                    layer_num += 1
             else:
-                return repr(o)
-            if not allow_nan:
-                raise ValueError(
-                    "Out of range float values are not JSON compliant: " +
-                    repr(o))
-            return text
+                name_type = get_name_type(layers)
+                model_flat.add_module(f'{name_type}_{block_num}_{layer_num}', layers)
+                layer_num += 1
 
-        _iterencode = json.encoder._make_iterencode(
-                markers, self.default, _encoder, self.indent, floatstr,
-                self.key_separator, self.item_separator, self.sort_keys,
-                self.skipkeys, _one_shot)
-        return _iterencode(o, 0)
-
-def dump_json_file(target, data):
-    with open(target, 'w') as f:
-        json.dump(data, f, indent=1, cls=FloatEncoder)
-
-def copy_static_file(source, target):
-    sourcefile = os.path.join(
-            os.path.dirname(inspect.getfile(netdissect)), source)
-    shutil.copy(sourcefile, target)
+    model_flat = nethook.InstrumentedModel(model_flat).cuda().eval()
+    return model_flat
 
 if __name__ == '__main__':
     main()
-
