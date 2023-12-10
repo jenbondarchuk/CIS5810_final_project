@@ -1,4 +1,4 @@
-# New-style dissection experiment code.
+# Neural Style Transfer -- MobileNetV2 Network Dissection
 import torch, argparse
 from netdissect import pbar, nethook, renormalize, pidfile
 from netdissect import tally, imgviz, imgsave
